@@ -21,6 +21,15 @@ DEFAULT_MARGIN_PER_LOT = {
 # Train / OOS split. Everything before SPLIT_DATE is in-sample.
 SPLIT_DATE = "2018-01-01"
 
+# Corn-only research split used in the product-flow corn sleeve:
+# train < 2016, validation 2016-2017, OOS >= 2018.
+CORN_TRAIN_END = "2016-01-01"
+CORN_TARGET_DAILY_PNL_VOL = 75.0
+CORN_MAX_ABS_LOT = 0.50
+CORN_TRADE_COST_PER_LOT = 8.75
+CORN_HOLDING_COST_RATE = 0.05
+CORN_IC_THRESHOLD = 0.015
+
 
 # ── Feature groups ─────────────────────────────────────────────────────────
 OUTRIGHT_CORE_FEATURES = [

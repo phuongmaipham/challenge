@@ -6,6 +6,7 @@ that I downloaded once at the start of the project.
 """
 
 import os
+from itertools import combinations
 import numpy as np
 import pandas as pd
 
@@ -1075,6 +1076,174 @@ def summarize_corn_backtest(bt, train_end=CORN_TRAIN_END, split_date=SPLIT_DATE)
         "turnover": full.loc["avg_daily_turnover", "full_period"],
         "avg_gross_exposure": full.loc["avg_gross_exposure", "full_period"],
     }
+
+
+def evaluate_corn_signal(test, signal_set, strategy, signal, futures_pnl, mode="long_short", note=""):
+    positions = corn_positions_from_signal(signal, futures_pnl, mode=mode)
+    bt, _ = backtest_positions_product_flow(positions, futures_pnl)
+    row = {
+        "test": test,
+        "signal_set": signal_set,
+        "strategy": strategy,
+        "mode": mode,
+        "note": note,
+    }
+    row.update(summarize_corn_backtest(bt))
+    return row, bt, positions
+
+
+def run_corn_generic_signal_tests(families_by_set, feature_panels, futures_pnl, trading_index):
+    rows, backtests, positions = [], {}, {}
+    diagnostics = {
+        "trend_choice_tables": {},
+        "dynamic_coeff_tables": {},
+        "selected_ic_tables": {},
+    }
+    for signal_set in ["A", "B"]:
+        families = families_by_set[signal_set]
+        trend_signal, trend_choices = corn_trend_mr_family_signal(families, futures_pnl, feature_panels)
+        dynamic_signal, coeff_table = corn_dynamic_linear_family_signal(families, futures_pnl)
+        ic_signal, ic_table = corn_select_by_ic_signal(families, futures_pnl)
+        diagnostics["trend_choice_tables"][signal_set] = trend_choices
+        diagnostics["dynamic_coeff_tables"][signal_set] = coeff_table
+        diagnostics["selected_ic_tables"][signal_set] = ic_table
+
+        tests = [
+            ("avg_all_signals", corn_average_all_signals(families, trading_index)),
+            ("equal_family", corn_equal_family_signal(families, trading_index)),
+            ("best_family_by_trend_mr", trend_signal),
+            ("dynamic_linear_coeff", dynamic_signal),
+            ("select_by_ic", ic_signal),
+        ]
+        for strategy, signal in tests:
+            row, bt, pos = evaluate_corn_signal("generic", signal_set, strategy, signal, futures_pnl)
+            rows.append(row)
+            backtests[(signal_set, strategy, "long_short")] = bt
+            positions[(signal_set, strategy, "long_short")] = pos
+
+    results = pd.DataFrame(rows).sort_values(
+        ["signal_set", "validation_sharpe", "oos_sharpe"],
+        ascending=[True, False, False],
+    )
+    return results, backtests, positions, diagnostics
+
+
+def run_corn_standalone_alpha_sleeves(families_by_set, futures_pnl, trading_index):
+    alpha_signals = {
+        name: corn_family_signal(members, trading_index)
+        for name, members in families_by_set["alpha"].items()
+    }
+
+    def signal_with_single_alpha(signal_set, alpha_name):
+        if signal_set == "A":
+            family_map = {
+                "prices": dict(families_by_set["A"]["prices"]),
+                "fundamentals": dict(families_by_set["B"]["fundamentals"]),
+            }
+            if alpha_name in ["eia", "weather"]:
+                family_map["fundamentals"].update(families_by_set["alpha"][alpha_name])
+            elif alpha_name == "macro":
+                family_map["macro"] = dict(families_by_set["alpha"]["macro"])
+            return "single_alpha_in_core", corn_equal_family_signal(family_map, trading_index)
+
+        if signal_set == "B":
+            b_core = corn_equal_family_signal(families_by_set["B"], trading_index)
+            return "core_plus_single_alpha_sleeve", mean_product_flow_signals([b_core, alpha_signals[alpha_name]], trading_index)
+
+        raise ValueError(f"Unknown signal set: {signal_set}")
+
+    rows, backtests, positions, context_signals = [], {}, {}, {}
+    for signal_set in ["A", "B"]:
+        for alpha_name in ["eia", "macro", "weather"]:
+            strategy, signal = signal_with_single_alpha(signal_set, alpha_name)
+            context_signals[(signal_set, alpha_name)] = signal
+            row, bt, pos = evaluate_corn_signal("single_alpha_sleeve", signal_set, strategy, signal, futures_pnl, note=alpha_name)
+            row["alpha"] = alpha_name
+            rows.append(row)
+            backtests[(signal_set, alpha_name, "long_short")] = bt
+            positions[(signal_set, alpha_name, "long_short")] = pos
+
+    results = pd.DataFrame(rows).sort_values(["signal_set", "validation_sharpe"], ascending=[True, False])
+    return results, backtests, positions, context_signals, alpha_signals
+
+
+def run_corn_alpha_combinations(families_by_set, alpha_signals, futures_pnl, trading_index):
+    def labels():
+        names = ["eia", "macro", "weather"]
+        yield tuple()
+        for size in range(2, len(names) + 1):
+            for combo in combinations(names, size):
+                yield combo
+
+    rows, backtests, positions, signals = [], {}, {}, {}
+    b_core = corn_equal_family_signal(families_by_set["B"], trading_index)
+    for combo in labels():
+        label = "none" if not combo else "+".join(combo)
+        a_map = {
+            "prices": dict(families_by_set["A"]["prices"]),
+            "fundamentals": dict(families_by_set["B"]["fundamentals"]),
+        }
+        if "eia" in combo:
+            a_map["fundamentals"].update(families_by_set["alpha"]["eia"])
+        if "weather" in combo:
+            a_map["fundamentals"].update(families_by_set["alpha"]["weather"])
+        if "macro" in combo:
+            a_map["macro"] = dict(families_by_set["alpha"]["macro"])
+
+        a_signal = corn_equal_family_signal(a_map, trading_index)
+        signals[("A", "combo_in_core", label)] = a_signal
+        row, bt, pos = evaluate_corn_signal("alpha_combo", "A", "combo_in_core", a_signal, futures_pnl, note=label)
+        row["alpha_combo"] = label
+        rows.append(row)
+        backtests[("A", "combo_in_core", label, "long_short")] = bt
+        positions[("A", "combo_in_core", label, "long_short")] = pos
+
+        if combo:
+            alpha_sleeve = mean_product_flow_signals([alpha_signals[name] for name in combo], trading_index)
+            b_signal = mean_product_flow_signals([b_core, alpha_sleeve], trading_index)
+        else:
+            b_signal = b_core
+        signals[("B", "core_plus_alpha_sleeve", label)] = b_signal
+        row, bt, pos = evaluate_corn_signal("alpha_combo", "B", "core_plus_alpha_sleeve", b_signal, futures_pnl, note=label)
+        row["alpha_combo"] = label
+        rows.append(row)
+        backtests[("B", "core_plus_alpha_sleeve", label, "long_short")] = bt
+        positions[("B", "core_plus_alpha_sleeve", label, "long_short")] = pos
+
+    results = pd.DataFrame(rows).sort_values(["signal_set", "mode", "validation_sharpe"], ascending=[True, True, False])
+    return results, backtests, positions, signals
+
+
+def run_corn_fixed_core_alpha_recipes(signals, families_by_set, futures_pnl, trading_index):
+    core_signals = {
+        "A": signals["given_conservative_blend"],
+        "B": corn_equal_family_signal(families_by_set["B"], trading_index),
+    }
+    selected_alpha_signals = {
+        "ethanol": signals["external_ethanol_family"],
+        "fx_export": signals["external_fx_export_family"],
+    }
+    fixed_alpha_recipes = {
+        "core_only": {"core": 1.00},
+        "core_90_ethanol_10": {"core": 0.90, "ethanol": 0.10},
+        "core_80_ethanol_10_fx_10": {"core": 0.80, "ethanol": 0.10, "fx_export": 0.10},
+        "core_70_ethanol_15_fx_15": {"core": 0.70, "ethanol": 0.15, "fx_export": 0.15},
+    }
+
+    rows, backtests, positions, recipe_signals = [], {}, {}, {}
+    for signal_set, core_signal in core_signals.items():
+        signal_library = {"core": core_signal, **selected_alpha_signals}
+        for name, weights in fixed_alpha_recipes.items():
+            signal = weighted_product_flow_signals(signal_library, weights, trading_index)
+            recipe_signals[(signal_set, name)] = signal
+            row, bt, pos = evaluate_corn_signal("fixed_core_alpha_recipe", signal_set, name, signal, futures_pnl)
+            row["core_weight"] = weights["core"]
+            rows.append(row)
+            backtests[(signal_set, name, "long_short")] = bt
+            positions[(signal_set, name, "long_short")] = pos
+
+    results = pd.DataFrame(rows).sort_values(["signal_set", "oos_sharpe", "full_sharpe"], ascending=[True, False, False])
+    return results, backtests, positions, recipe_signals
 
 
 def product_flow_period_performance(bt, periods=None):
