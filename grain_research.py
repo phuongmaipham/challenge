@@ -1,515 +1,145 @@
-"""Core utilities for the grain-strategy research notebook.
+"""Corn strategy research functions used by the backtest notebook.
 
-Everything is plain pandas/numpy so the notebook stays portable. External
-data (yfinance, weather, EIA) is read from CSVs in the `train_set` folder
-that I downloaded once at the start of the project.
+The notebook imports from this module directly. Corn-only feature builders,
+signal selection, position sizing, and candidate guard tests live here so the
+bundle has fewer helper files while still keeping `grain_futures_strategy.py`
+small and shared by all notebooks.
 """
 
-import os
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 from research_config import (
-    COMMODITIES,
+    COMMODITY_LOCATION_WEIGHTS,
     CONTRACT_MULTIPLIER,
-    DEFAULT_MARGIN_PER_LOT,
-    SPLIT_DATE,
-    CORN_TRAIN_END,
-    CORN_TARGET_DAILY_PNL_VOL,
-    CORN_MAX_ABS_LOT,
-    CORN_TRADE_COST_PER_LOT,
     CORN_HOLDING_COST_RATE,
     CORN_IC_THRESHOLD,
-    OUTRIGHT_CORE_FEATURES,
-    OUTRIGHT_PHYSICAL_FEATURES,
-    COST_CASES,
+    CORN_MAX_ABS_LOT,
+    CORN_TARGET_DAILY_PNL_VOL,
+    CORN_TRADE_COST_PER_LOT,
+    CORN_TRAIN_END,
+    DEFAULT_MARGIN_PER_LOT,
     REGIME_PERIODS,
-    METEOSTAT_LOCATIONS,
-    COMMODITY_LOCATION_WEIGHTS,
-    families_for_variant,
+    SPLIT_DATE,
 )
+from grain_futures_strategy import load_train_set
+from strategy_backtest_common import backtest_positions_with_costs, split_performance
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Data loading
-# ═══════════════════════════════════════════════════════════════════════════
+__all__ = [
+    "build_product_flow_feature_panels",
+    "load_train_set",
+    "build_corn_product_flow_signal_universe",
+    "corn_signal_set_families",
+    "corn_average_all_signals",
+    "corn_equal_family_signal",
+    "corn_select_by_ic_signal",
+    "corn_trend_mr_family_signal",
+    "corn_dynamic_linear_family_signal",
+    "corn_family_signal",
+    "mean_product_flow_signals",
+    "corn_positions_from_signal",
+    "backtest_positions_product_flow",
+    "summarize_corn_backtest",
+    "clean_product_flow_signal",
+    "product_flow_performance_metrics",
+    "product_flow_period_performance",
+    "build_corn_vol_regime_signal",
+    "corn_abundant_supply_masks",
+    "build_corn_carry_forward_candidates",
+    "make_corn_candidate",
+    "summarize_corn_candidates",
+    "run_corn_supply_guard_tests",
+    "corn_given_signal_universe",
+    "build_corn_product_flow_yfinance_families",
+    "build_corn_product_flow_ethanol_family",
+    "build_corn_product_flow_weather_family",
+]
 
-def load_train_set(data_dir="train_set"):
-    """Load every CSV in train_set into a dict of DataFrames keyed by name."""
-    names = {
-        "adj1":        "train_adjPrices1.csv",
-        "adj2":        "train_adjPrices2.csv",
-        "unadj1":      "train_unadjPrices1.csv",
-        "unadj2":      "train_unadjPrices2.csv",
-        "cot_mm":      "train_cot_mm.csv",
-        "cot_pm_oi":   "train_cot_pm_oi.csv",
-        "inventories": "train_inventories.csv",
-        "receipts":    "train_receipts.csv",
-        "cgl_inv":     "train_cgl_inv.csv",
-        "cgl_crush":   "train_cgl_crush.csv",
-    }
-    data = {}
-    for key, filename in names.items():
-        df = pd.read_csv(os.path.join(data_dir, filename), index_col=0, parse_dates=True)
-        data[key] = df.sort_index().apply(pd.to_numeric, errors="coerce")
-    return data
+
+def _csv_path(data_dir, filename):
+    return Path(data_dir) / filename
+
+
+def _read_indexed_numeric_csv(data_dir, filename):
+    df = pd.read_csv(_csv_path(data_dir, filename), index_col=0, parse_dates=True)
+    return df.sort_index().apply(pd.to_numeric, errors="coerce")
 
 
 def load_external_yfinance(data_dir="train_set"):
-    return pd.read_csv(os.path.join(data_dir, "external_yfinance.csv"),
-                       index_col=0, parse_dates=True).sort_index()
+    return _read_indexed_numeric_csv(data_dir, "external_yfinance.csv")
 
 
 def load_external_weather(data_dir="train_set"):
-    df = pd.read_csv(os.path.join(data_dir, "external_weather.csv"))
+    df = pd.read_csv(_csv_path(data_dir, "external_weather.csv"))
     df["date"] = pd.to_datetime(df["date"])
     return df
 
 
 def load_external_eia_ethanol(data_dir="train_set"):
-    return pd.read_csv(os.path.join(data_dir, "external_eia_ethanol.csv"),
-                       index_col=0, parse_dates=True).sort_index()
+    return _read_indexed_numeric_csv(data_dir, "external_eia_ethanol.csv")
+
+
+PRICE_SIGNAL_NAMES = (
+    "given_mom_20",
+    "given_mom_60",
+    "given_rev_5",
+    "given_curve_spread",
+    "given_curve_ratio",
+    "given_price_family",
+)
+FUNDAMENTAL_CORE_SIGNAL_NAMES = (
+    "given_inventory_pressure",
+    "given_cgl_inventory_pressure",
+    "given_cgl_crush_activity",
+    "given_curve_tightness",
+    "given_physical_family",
+)
+MACRO_SIGNAL_NAMES = (
+    "external_fx_export_family",
+    "external_macro_risk_family",
+)
+WEATHER_FAMILY_FEATURES = (
+    "meteo_cdd_20d_growing",
+    "meteo_hdd_20d_growing",
+    "meteo_gdd_60d_growing",
+    "meteo_heat_stress_20d_growing",
+    "meteo_dryness_20d_growing",
+    "meteo_dry_cdd_20d_growing",
+    "meteo_precip_20d_planting",
+    "meteo_dryness_20d_planting",
+    "meteo_freeze_stress_5d_harvest",
+)
+
+CANDIDATE_FAMILY_DEFINITIONS = {
+    "price": ["given_mom_20", "given_mom_60", "given_rev_5", "given_price_family"],
+    "physical": [
+        "given_inventory_pressure",
+        "given_cgl_inventory_pressure",
+        "given_cgl_crush_activity",
+        "given_curve_tightness",
+        "given_physical_family",
+    ],
+    "ethanol": ["external_ethanol_family"],
+    "fx_export": ["external_fx_export_family"],
+    "weather": ["external_weather_hdd_cdd_family"],
+    "macro": ["external_macro_risk_family", "external_relative_grain_family"],
+}
+CANDIDATE_COMPOSITE_DEFINITIONS = {
+    "selected_all_equal": None,
+    "physical_only": ["physical"],
+    "price_physical_equal": ["price", "physical"],
+    "physical_fx_equal": ["physical", "fx_export"],
+    "physical_weather_equal": ["physical", "weather"],
+    "physical_macro_equal": ["physical", "macro"],
+    "physical_ethanol_equal": ["physical", "ethanol"],
+    "physical_ethanol_fx_equal": ["physical", "ethanol", "fx_export"],
+    "physical_ethanol_weather_equal": ["physical", "ethanol", "weather"],
+    "physical_ethanol_fx_weather_equal": ["physical", "ethanol", "fx_export", "weather"],
+}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Lag-aware alignment, feature engineering
-# ═══════════════════════════════════════════════════════════════════════════
-
-def to_available_calendar(df, trading_index, lag_days):
-    """Treat each row's date as observation date, shift by `lag_days`, ffill."""
-    if df is None or df.empty:
-        return pd.DataFrame(index=trading_index)
-    available = df.copy()
-    available.index = available.index + pd.Timedelta(days=lag_days)
-    return available.reindex(trading_index, method="ffill")
-
-
-def rolling_zscore(series, lookback, min_periods=None):
-    if min_periods is None:
-        min_periods = max(20, lookback // 4)
-    mean = series.rolling(lookback, min_periods=min_periods).mean()
-    std = series.rolling(lookback, min_periods=min_periods).std()
-    return ((series - mean) / std.replace(0.0, np.nan)).clip(-5.0, 5.0).fillna(0.0)
-
-
-def build_feature_panels(data):
-    """Return a dict {commodity -> feature DataFrame} plus the futures pnl.
-
-    Features are computed from adjusted prices (returns, momentum, vol),
-    unadjusted prices (curve spread, curve change), COT, inventories,
-    receipts, Cargill inventories and crush.
-    """
-    adj = data["adj1"][COMMODITIES].copy()
-    unadj1 = data["unadj1"][COMMODITIES].copy()
-    unadj2 = data["unadj2"][COMMODITIES].copy()
-    trading_index = adj.index
-
-    futures_pnl = adj.diff() * CONTRACT_MULTIPLIER
-
-    feature_panels = {c: pd.DataFrame(index=trading_index) for c in COMMODITIES}
-
-    # ── Price-derived features (per commodity)
-    # All features are z-scored over rolling windows so they are comparable
-    # in magnitude across commodities and across families.
-    for c in COMMODITIES:
-        price = adj[c]
-        feature_panels[c]["mom_20"] = rolling_zscore(price.pct_change(20), 252)
-        feature_panels[c]["mom_60"] = rolling_zscore(price.pct_change(60), 252)
-        feature_panels[c]["rev_5"]  = -rolling_zscore(price.pct_change(5), 126)
-        feature_panels[c]["vol_20"] = rolling_zscore(price.pct_change().rolling(20).std(), 252)
-
-        spread = unadj2[c] - unadj1[c]
-        ratio  = unadj2[c] / unadj1[c].replace(0.0, np.nan) - 1.0
-        feature_panels[c]["curve_spread"]    = rolling_zscore(spread, 252)
-        feature_panels[c]["curve_ratio"]     = rolling_zscore(ratio, 252)
-        feature_panels[c]["curve_change_20"] = rolling_zscore(spread.diff(20), 252)
-
-    # ── COT features (1-day lag for safety)
-    for tbl, label in [("cot_mm", "cot_mm_level"), ("cot_pm_oi", "cot_pm_oi_level")]:
-        if tbl in data and not data[tbl].empty:
-            aligned = to_available_calendar(data[tbl], trading_index, lag_days=1)
-            for c in COMMODITIES:
-                if c in aligned.columns:
-                    feature_panels[c][label] = rolling_zscore(aligned[c], 156)
-
-    # ── Public inventories / receipts (1-day lag)
-    if "inventories" in data and not data["inventories"].empty:
-        aligned = to_available_calendar(data["inventories"], trading_index, 1)
-        for c in COMMODITIES:
-            if c in aligned.columns:
-                feature_panels[c]["public_inventory_level"]  = rolling_zscore(aligned[c], 252)
-                feature_panels[c]["public_inventory_change"] = rolling_zscore(aligned[c].diff(20), 252)
-
-    if "receipts" in data and not data["receipts"].empty:
-        aligned = to_available_calendar(data["receipts"], trading_index, 1)
-        for c in COMMODITIES:
-            if c in aligned.columns:
-                feature_panels[c]["receipts_change"] = rolling_zscore(aligned[c].diff(20), 252)
-
-    # ── Cargill inventory / crush (1-day lag)
-    if "cgl_inv" in data and not data["cgl_inv"].empty:
-        aligned = to_available_calendar(data["cgl_inv"], trading_index, 1)
-        for c in COMMODITIES:
-            if c in aligned.columns:
-                feature_panels[c]["cgl_inventory_change"] = rolling_zscore(aligned[c].diff(20), 252)
-
-    if "cgl_crush" in data and not data["cgl_crush"].empty:
-        crush = to_available_calendar(data["cgl_crush"], trading_index, 1)
-        if "SOYABEAN" in crush.columns:
-            feature_panels["SOYABEAN"]["crush_surprise"]    = rolling_zscore(crush["SOYABEAN"].diff(5), 252)
-            feature_panels["SOYABEAN"]["crush_utilization"] = rolling_zscore(crush["SOYABEAN"], 252)
-
-    # Trim warm-up rows.
-    for c in COMMODITIES:
-        feature_panels[c] = feature_panels[c].iloc[252:].copy()
-    futures_pnl = futures_pnl.loc[feature_panels[COMMODITIES[0]].index]
-
-    return feature_panels, futures_pnl
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# External signal builders (read from CSV — no live downloads)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def build_yfinance_features(trading_index, data_dir="train_set"):
-    closes = load_external_yfinance(data_dir)
-    closes = closes.reindex(trading_index, method="ffill")
-    rets = closes.pct_change()
-
-    feats = pd.DataFrame(index=trading_index)
-    for col in closes.columns:
-        feats[f"{col}_mom_20"]  = rolling_zscore(rets[col].rolling(20).mean(), 252)
-        feats[f"{col}_mom_60"]  = rolling_zscore(rets[col].rolling(60).mean(), 252)
-        feats[f"{col}_level_z"] = rolling_zscore(closes[col], 252)
-    return feats
-
-
-def build_full_panel(commodity, feature_panels, weather_features, ethanol_features, yfin_features):
-    """Join all feature sources into one DataFrame for the requested commodity."""
-    panel = feature_panels[commodity].copy()
-    if commodity in weather_features:
-        panel = panel.join(weather_features[commodity], rsuffix="_wx")
-    panel = panel.join(ethanol_features, rsuffix="_eia")
-    panel = panel.join(yfin_features, rsuffix="_yf")
-    return panel
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Family-based signal aggregation
-# ═══════════════════════════════════════════════════════════════════════════
-
-def family_signal(panel, family_features, smooth=10):
-    """Equal-weight z-scored features inside one family.
-
-    `family_features` is a {feature_name: sign} dict.  Missing features are
-    silently dropped — that way the same recipe can be used with the PROVIDED
-    or FULL feature panel.
-    """
-    cols = [(f, s) for f, s in family_features.items() if f in panel.columns]
-    if not cols:
-        return pd.Series(0.0, index=panel.index)
-    df = pd.concat([s * panel[f] for f, s in cols], axis=1)
-    sig = df.mean(axis=1)
-    return sig.rolling(smooth, min_periods=1).mean()
-
-
-def equal_family_weight(panel, families, smooth=10):
-    """Equal-weight every family, then average families together.
-
-    Equal-weighting at the family level (instead of feature level) keeps any
-    one large family from dominating just because it has more features.
-    """
-    sigs = [family_signal(panel, feats, smooth=smooth) for feats in families.values()]
-    if not sigs:
-        return pd.Series(0.0, index=panel.index)
-    return pd.concat(sigs, axis=1).mean(axis=1)
-
-
-def ic_family_selected(panel, families, target, train_mask, top_n=2, smooth=10):
-    """Pick the top-N families by absolute IS information coefficient, equal-weight them.
-
-    The IS IC fixes which families to use — selection is locked before OOS.
-    A negative IC family is included with its sign flipped (so it still
-    contributes positively).
-    """
-    ics = {}
-    for fname, feats in families.items():
-        sig = family_signal(panel, feats, smooth=smooth)
-        valid = train_mask & sig.notna() & target.notna()
-        if valid.sum() < 100:
-            continue
-        ics[fname] = sig[valid].corr(target[valid])
-
-    if not ics:
-        return pd.Series(0.0, index=panel.index), {}
-
-    ranked = sorted(ics.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
-    sigs = []
-    for fname, ic in ranked:
-        sig = family_signal(panel, families[fname], smooth=smooth)
-        sigs.append(np.sign(ic) * sig)
-    out = pd.concat(sigs, axis=1).mean(axis=1)
-    return out, dict(ranked)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Wheat: SRW/HRW pair MR with Cargill physical-pressure overlay
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _wheat_pair_components(panel):
-    """Per-leg wheat features grouped into the components used in pair signals."""
-    return {
-        "price_mr":         panel["rev_5"],
-        "curve":            (panel["curve_spread"] + panel["curve_ratio"] + panel["curve_change_20"]) / 3.0,
-        "physical_public":  (-panel["public_inventory_change"] - panel["receipts_change"]) / 2.0,
-        "physical_cargill": (-panel["cgl_inventory_change"] + panel.get("crush_surprise", 0.0)
-                              + panel.get("crush_utilization", 0.0)) / 3.0,
-    }
-
-
-def wheat_pair_mr_with_cargill(feature_panels, futures_pnl, mr_weight=0.9, cargill_weight=0.1,
-                                target_daily_pair_vol=40.0, max_leg_lot=0.45,
-                                halflife=5.0, signal_threshold=0.12, rebalance_every=5):
-    """Wheat SRW/HRW pair: 5-day reversal MR + Cargill physical-pressure overlay.
-
-    Faithful to the original `pair_price_mr_cargill_90_10_cost_control`:
-      • Per-leg `rev_5` and Cargill physical components are differenced (SRW - HRW).
-      • A weighted blend (default 90% MR + 10% Cargill) gives the pair score.
-      • The pair score is squashed by tanh, EWM-smoothed (halflife 5), and
-        zeroed below |score| < threshold.
-      • Positions are *fractional* lots, vol-scaled, clipped to ±0.45 per leg,
-        and rebalanced weekly to keep turnover low.
-
-    The wheat pair is a small, low-volume sleeve — fractional lot sizing
-    matters a lot here. Integer-lot rounding would kill the strategy.
-    """
-    srw_panel = feature_panels["WHEAT_SRW"].reindex(futures_pnl.index)
-    hrw_panel = feature_panels["WHEAT_HRW"].reindex(futures_pnl.index)
-    srw_components = _wheat_pair_components(srw_panel)
-    hrw_components = _wheat_pair_components(hrw_panel)
-
-    pair_price_mr        = (srw_components["price_mr"]         - hrw_components["price_mr"]).fillna(0.0)
-    pair_physical_cargill = (srw_components["physical_cargill"] - hrw_components["physical_cargill"]).fillna(0.0)
-
-    pair_score = mr_weight * pair_price_mr + cargill_weight * pair_physical_cargill
-    pair_score = np.tanh(pair_score)
-    pair_score = pair_score.ewm(halflife=float(halflife), adjust=False, min_periods=1).mean()
-    pair_score = pair_score.where(pair_score.abs() >= float(signal_threshold), 0.0)
-
-    # Fractional vol-scaled positions, clipped to ±max_leg_lot.
-    leg_vol = futures_pnl[["WHEAT_SRW", "WHEAT_HRW"]].rolling(60, min_periods=20).std().shift(1).replace(0.0, np.nan)
-    srw_pos = pair_score * (target_daily_pair_vol / leg_vol["WHEAT_SRW"])
-    hrw_pos = -pair_score * (target_daily_pair_vol / leg_vol["WHEAT_HRW"])
-
-    positions = pd.DataFrame(0.0, index=futures_pnl.index, columns=COMMODITIES)
-    positions["WHEAT_SRW"] = srw_pos.clip(-max_leg_lot, max_leg_lot).fillna(0.0)
-    positions["WHEAT_HRW"] = hrw_pos.clip(-max_leg_lot, max_leg_lot).fillna(0.0)
-
-    # Weekly rebalance: only update positions every `rebalance_every` days.
-    if int(rebalance_every) > 1:
-        rebalance_mask = pd.Series(False, index=positions.index)
-        rebalance_mask.iloc[::int(rebalance_every)] = True
-        positions = positions.where(rebalance_mask, axis=0).ffill().fillna(0.0)
-
-    return positions, {"pair_price_mr": pair_price_mr,
-                        "pair_physical_cargill": pair_physical_cargill,
-                        "pair_score": pair_score}
-
-
-def build_weather_features(trading_index, data_dir="train_set"):
-    weather = load_external_weather(data_dir)
-    feats_by_commodity = {}
-    for commodity, weights in COMMODITY_LOCATION_WEIGHTS.items():
-        frames = []
-        for location, w in weights.items():
-            sub = weather.loc[weather["location"] == location].copy()
-            sub = sub.set_index("date")[["tavg", "prcp"]] * float(w)
-            frames.append(sub)
-        combined = sum(frames).sort_index() if frames else pd.DataFrame()
-        if combined.empty:
-            feats_by_commodity[commodity] = pd.DataFrame(index=trading_index)
-            continue
-        aligned = combined.reindex(trading_index, method="ffill")
-        out = pd.DataFrame(index=trading_index)
-        # Crude "heating/cooling degree day" proxies relative to 18C base.
-        out["hdd"] = (18.0 - aligned["tavg"]).clip(lower=0).rolling(20).sum()
-        out["cdd"] = (aligned["tavg"] - 18.0).clip(lower=0).rolling(20).sum()
-        out["prcp_20d"] = aligned["prcp"].rolling(20).sum()
-        out = out.apply(lambda s: rolling_zscore(s, 252))
-        feats_by_commodity[commodity] = out
-    return feats_by_commodity
-
-
-def build_ethanol_features(trading_index, data_dir="train_set"):
-    eth = load_external_eia_ethanol(data_dir)
-    # Push observation date forward by 7 days to respect EIA's weekly release lag.
-    eth.index = eth.index + pd.Timedelta(days=7)
-    aligned = eth.reindex(trading_index, method="ffill").shift(1)
-    feats = pd.DataFrame(index=trading_index)
-    if "ethanol_production" in aligned:
-        feats["ethanol_production_z"]  = rolling_zscore(aligned["ethanol_production"], 156)
-        feats["ethanol_production_d4"] = rolling_zscore(aligned["ethanol_production"].diff(20), 156)
-    if "ethanol_stocks" in aligned:
-        feats["ethanol_stocks_z"]  = rolling_zscore(aligned["ethanol_stocks"], 156)
-        feats["ethanol_stocks_d4"] = rolling_zscore(aligned["ethanol_stocks"].diff(20), 156)
-    return feats
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Signal → position → backtest
-# ═══════════════════════════════════════════════════════════════════════════
-
-def signal_to_positions(predictions, futures_pnl, vol_target_daily=0.01):
-    """Convert per-commodity z-score-like predictions into integer lot positions.
-
-    Sign of the position follows the sign of the prediction; size is scaled
-    by recent realised vol so a high-vol contract gets a smaller lot count.
-    """
-    pos = pd.DataFrame(0.0, index=futures_pnl.index, columns=futures_pnl.columns)
-    for c in pos.columns:
-        if c not in predictions.columns:
-            continue
-        sig = predictions[c].fillna(0.0)
-        vol = futures_pnl[c].rolling(60, min_periods=20).std().bfill().fillna(1.0)
-        target_pnl = vol_target_daily * 1_000_000.0
-        scale = (target_pnl / vol).clip(upper=20.0)
-        pos[c] = (sig.clip(-3, 3) / 3.0 * scale).round().astype(float)
-    return pos
-
-
-def backtest_positions(positions, futures_pnl, trade_cost_per_lot=0.0,
-                       holding_cost_rate=0.0, margin_budget=np.inf):
-    """Daily PnL accounting with simple cost and margin-budget controls."""
-    pos = positions.shift(1).fillna(0.0)
-
-    # Margin cap: scale all positions down on days we exceed the budget.
-    if np.isfinite(margin_budget):
-        notional_margin = pd.Series(0.0, index=pos.index)
-        for c in pos.columns:
-            notional_margin += pos[c].abs() * DEFAULT_MARGIN_PER_LOT.get(c, 2500.0)
-        scale = (margin_budget / notional_margin.replace(0.0, np.nan)).clip(upper=1.0).fillna(1.0)
-        pos = pos.mul(scale, axis=0)
-
-    gross = (pos * futures_pnl).sum(axis=1)
-    turnover = pos.diff().abs().sum(axis=1).fillna(pos.abs().sum(axis=1))
-    trade_cost = turnover * trade_cost_per_lot
-    holding_cost = pos.abs().sum(axis=1) * (holding_cost_rate / 252.0) * 1000.0
-    net = gross - trade_cost - holding_cost
-    return pd.DataFrame({"gross": gross, "net": net, "turnover": turnover, "positions": pos.abs().sum(axis=1)})
-
-
-def perf_summary(bt, split_date=SPLIT_DATE):
-    """Sharpe/PnL/drawdown over in-sample, OOS, and full-period."""
-    out = []
-    full = bt["net"]
-    is_mask  = full.index <  pd.Timestamp(split_date)
-    oos_mask = full.index >= pd.Timestamp(split_date)
-
-    for label, mask in [("in_sample", is_mask), ("out_of_sample", oos_mask), ("full_period", slice(None))]:
-        seg = full.loc[mask] if mask is not slice(None) else full
-        if len(seg) == 0 or seg.std() == 0:
-            sharpe, pnl, dd = 0.0, 0.0, 0.0
-        else:
-            sharpe = seg.mean() / seg.std() * np.sqrt(252)
-            pnl = seg.sum()
-            cum = seg.cumsum()
-            dd = (cum - cum.cummax()).min()
-        out.append({"segment": label, "sharpe": sharpe, "pnl": pnl, "max_drawdown": dd})
-    return pd.DataFrame(out).set_index("segment")
-
-
-def evaluate_under_cost_cases(positions, futures_pnl):
-    """Backtest across all four cost cases and stack into one table."""
-    rows = []
-    for case in COST_CASES:
-        bt = backtest_positions(
-            positions, futures_pnl,
-            trade_cost_per_lot=case["trade_cost_per_lot"],
-            holding_cost_rate=case["holding_cost_rate"],
-            margin_budget=case["margin_budget"],
-        )
-        perf = perf_summary(bt)
-        rows.append({
-            "cost_case": case["case"],
-            "is_sharpe":  perf.loc["in_sample", "sharpe"],
-            "oos_sharpe": perf.loc["out_of_sample", "sharpe"],
-            "oos_pnl":    perf.loc["out_of_sample", "pnl"],
-            "full_sharpe": perf.loc["full_period", "sharpe"],
-            "full_pnl":    perf.loc["full_period", "pnl"],
-            "max_drawdown": perf.loc["full_period", "max_drawdown"],
-            "avg_turnover": bt["turnover"].mean(),
-        })
-    return pd.DataFrame(rows)
-
-
-def regime_performance(bt):
-    """Return PnL/Sharpe for each named historical regime."""
-    rows = []
-    full = bt["net"]
-    for r in REGIME_PERIODS:
-        mask = (full.index >= pd.Timestamp(r["start"])) & (full.index <= pd.Timestamp(r["end"]))
-        seg = full.loc[mask]
-        if len(seg) == 0:
-            rows.append({"period": r["period"], "pnl": 0.0, "sharpe": 0.0, "days": 0})
-            continue
-        pnl = seg.sum()
-        sharpe = (seg.mean() / seg.std() * np.sqrt(252)) if seg.std() > 0 else 0.0
-        rows.append({"period": r["period"], "pnl": pnl, "sharpe": sharpe, "days": int(mask.sum())})
-    return pd.DataFrame(rows)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Signal aggregation patterns
-# ═══════════════════════════════════════════════════════════════════════════
-
-def features_to_per_commodity_signal(feature_panels, feature_names, futures_pnl):
-    """Equal-weight a list of features into a per-commodity prediction.
-
-    All features are z-scored already, so a simple mean works as a baseline
-    aggregator. Sign reflects "expected positive return" by convention.
-    """
-    preds = pd.DataFrame(0.0, index=futures_pnl.index, columns=COMMODITIES)
-    for c in COMMODITIES:
-        panel = feature_panels.get(c)
-        if panel is None or panel.empty:
-            continue
-        cols = [f for f in feature_names if f in panel.columns]
-        if not cols:
-            continue
-        preds[c] = panel[cols].mean(axis=1)
-    return preds
-
-
-def online_ols_predictions(feature_panel, target, train_mask, min_train_days=252):
-    """Walk-forward OLS predictions, expanding window after the warm-up.
-
-    Used only as a single fitted-model benchmark — I want to see whether
-    fitting coefficients beats fixed economic recipes. (No Ridge or RLS
-    variants — those mostly add hyperparameter risk for this dataset.)
-    """
-    feats = feature_panel.fillna(0.0).values
-    y = target.fillna(0.0).values
-    preds = np.zeros(len(y))
-
-    # Fit once on the full in-sample, then apply forward.
-    train_idx = np.where(train_mask & (np.arange(len(y)) >= min_train_days))[0]
-    if len(train_idx) < 50:
-        return pd.Series(preds, index=target.index)
-
-    x_train, y_train = feats[train_idx], y[train_idx]
-    # Standardise X.
-    mu, sd = x_train.mean(0), x_train.std(0) + 1e-9
-    x_std = (x_train - mu) / sd
-    beta = np.linalg.lstsq(x_std, y_train, rcond=None)[0]
-
-    x_all_std = (feats - mu) / sd
-    preds = x_all_std @ beta
-    return pd.Series(preds, index=target.index)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Corn product-flow-aligned helpers
-# ═══════════════════════════════════════════════════════════════════════════
 
 def rolling_zscore_product_flow(obj, window=252, min_periods=40):
     """Rolling z-score matching the product-flow notebook convention."""
@@ -525,6 +155,70 @@ def to_available_calendar_product_flow(df, trading_index, lag_days):
     out = out.sort_index()
     out = out.groupby(out.index).last()
     return out.reindex(trading_index).ffill()
+
+
+def clean_product_flow_signal(series, index=None):
+    if index is None:
+        index = series.index
+    return (
+        pd.Series(series, index=index)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(-5.0, 5.0)
+    )
+
+
+def mean_product_flow_signals(items, index):
+    values = [item.reindex(index) for item in items if item is not None]
+    if not values:
+        return pd.Series(0.0, index=index)
+    return clean_product_flow_signal(sum(values) / float(len(values)), index)
+
+
+def corn_research_split_masks(index, train_end=CORN_TRAIN_END, split_date=SPLIT_DATE):
+    """Return the train/validation/test masks used by corn notebook helpers."""
+    index = pd.DatetimeIndex(index)
+    train_end = pd.Timestamp(train_end)
+    split_date = pd.Timestamp(split_date)
+    return {
+        "train": pd.Series(index < train_end, index=index),
+        "validation": pd.Series((index >= train_end) & (index < split_date), index=index),
+        "test": pd.Series(index >= split_date, index=index),
+    }
+
+
+def rank_ic_product_flow(signal, target, mask):
+    aligned = pd.concat([signal, target], axis=1).dropna()
+    if aligned.empty:
+        return np.nan
+    mask = pd.Series(mask, index=signal.index).reindex(aligned.index).fillna(False).astype(bool)
+    aligned = aligned.loc[mask]
+    if len(aligned) < 40 or aligned.iloc[:, 0].std() == 0.0 or aligned.iloc[:, 1].std() == 0.0:
+        return np.nan
+    ranks = aligned.rank(method="average")
+    corr = ranks.iloc[:, 0].corr(ranks.iloc[:, 1])
+    return float(corr) if pd.notnull(corr) else np.nan
+
+
+def smooth_corn_signal(signal, mode="long_short"):
+    index = signal.index
+    out = pd.Series(np.tanh(signal.astype(float) / 2.0), index=index)
+    out = out.ewm(halflife=2.0, adjust=False, min_periods=1).mean()
+    out[out.abs() < 0.05] = 0.0
+    if mode == "long_only":
+        out = out.clip(lower=0.0)
+    elif mode == "short_only":
+        out = out.clip(upper=0.0)
+    elif mode != "long_short":
+        raise ValueError(f"Unknown mode: {mode}")
+    return out.fillna(0.0)
+
+
+def scale_corn_positions_when(positions, condition, scale):
+    out = positions.copy()
+    mask = pd.Series(condition, index=positions.index).fillna(False).astype(bool)
+    out.loc[mask, "CORN"] = float(scale) * out.loc[mask, "CORN"]
+    return out.fillna(0.0)
 
 
 def build_product_flow_feature_panels(data, commodities=("CORN",)):
@@ -625,36 +319,6 @@ def corn_given_signal_universe(feature_panels):
         "given_conservative_blend": conservative,
     }
     return {name: clean_product_flow_signal(signal, panel.index) for name, signal in signals.items()}
-
-
-def clean_product_flow_signal(series, index=None):
-    if index is None:
-        index = series.index
-    return (
-        pd.Series(series, index=index)
-        .replace([np.inf, -np.inf], np.nan)
-        .fillna(0.0)
-        .clip(-5.0, 5.0)
-    )
-
-
-def mean_product_flow_signals(items, index):
-    values = [item.reindex(index) for item in items if item is not None]
-    if not values:
-        return pd.Series(0.0, index=index)
-    return clean_product_flow_signal(sum(values) / float(len(values)), index)
-
-
-def weighted_product_flow_signals(signals, weights, index):
-    total = pd.Series(0.0, index=index)
-    used = 0.0
-    for name, weight in weights.items():
-        if name in signals and float(weight) != 0.0:
-            total = total + float(weight) * signals[name].reindex(index)
-            used += float(weight)
-    if used == 0.0:
-        return pd.Series(0.0, index=index)
-    return clean_product_flow_signal(total / used, index)
 
 
 def build_corn_product_flow_yfinance_families(trading_index, data_dir="train_set"):
@@ -770,21 +434,17 @@ def build_corn_product_flow_weather_family(trading_index, data_dir="train_set"):
             continue
         sub[value_cols] = sub[value_cols] * float(weight)
         frames.append(sub)
+    if not frames:
+        features = pd.DataFrame(index=trading_index)
+        family = pd.Series(0.0, index=trading_index)
+        return {
+            "external_weather_hdd_cdd_family": clean_product_flow_signal(family, trading_index),
+            "weather_features": features,
+        }
     combined = pd.concat(frames, ignore_index=True).groupby("date")[value_cols].sum().sort_index()
     aligned = combined.reindex(trading_index).ffill().shift(1)
     features = _add_product_flow_weather_features(aligned, seasonal=True)
-    candidates = [
-        "meteo_cdd_20d_growing",
-        "meteo_hdd_20d_growing",
-        "meteo_gdd_60d_growing",
-        "meteo_heat_stress_20d_growing",
-        "meteo_dryness_20d_growing",
-        "meteo_dry_cdd_20d_growing",
-        "meteo_precip_20d_planting",
-        "meteo_dryness_20d_planting",
-        "meteo_freeze_stress_5d_harvest",
-    ]
-    existing = [c for c in candidates if c in features.columns]
+    existing = [c for c in WEATHER_FAMILY_FEATURES if c in features.columns]
     family = features[existing].mean(axis=1) if existing else pd.Series(0.0, index=trading_index)
     return {
         "external_weather_hdd_cdd_family": clean_product_flow_signal(family, trading_index),
@@ -804,32 +464,20 @@ def build_corn_product_flow_signal_universe(feature_panels, futures_pnl, data_di
     return {name: clean_product_flow_signal(signal, index) for name, signal in signals.items()}
 
 
+def _required_signal_map(signals, names):
+    return {name: signals[name] for name in names}
+
+
 def corn_signal_set_families(signals):
     """Families used for the requested Signal A / Signal B corn tests."""
-    prices = {
-        "given_mom_20": signals["given_mom_20"],
-        "given_mom_60": signals["given_mom_60"],
-        "given_rev_5": signals["given_rev_5"],
-        "given_curve_spread": signals["given_curve_spread"],
-        "given_curve_ratio": signals["given_curve_ratio"],
-        "given_price_family": signals["given_price_family"],
-    }
+    prices = _required_signal_map(signals, PRICE_SIGNAL_NAMES)
     if "external_relative_grain_family" in signals:
         prices["external_relative_grain_family"] = signals["external_relative_grain_family"]
-    fundamentals_core = {
-        "given_inventory_pressure": signals["given_inventory_pressure"],
-        "given_cgl_inventory_pressure": signals["given_cgl_inventory_pressure"],
-        "given_cgl_crush_activity": signals["given_cgl_crush_activity"],
-        "given_curve_tightness": signals["given_curve_tightness"],
-        "given_physical_family": signals["given_physical_family"],
-    }
+    fundamentals_core = _required_signal_map(signals, FUNDAMENTAL_CORE_SIGNAL_NAMES)
     fundamentals_a = dict(fundamentals_core)
     fundamentals_a["external_ethanol_family"] = signals["external_ethanol_family"]
     fundamentals_a["external_weather_hdd_cdd_family"] = signals["external_weather_hdd_cdd_family"]
-    macro = {
-        "external_fx_export_family": signals["external_fx_export_family"],
-        "external_macro_risk_family": signals["external_macro_risk_family"],
-    }
+    macro = _required_signal_map(signals, MACRO_SIGNAL_NAMES)
     return {
         "A": {"prices": prices, "fundamentals": fundamentals_a, "macro": macro},
         "B": {"prices": prices, "fundamentals": fundamentals_core},
@@ -860,15 +508,13 @@ def corn_select_by_ic_signal(families, futures_pnl, min_abs_ic=CORN_IC_THRESHOLD
     """Select and orient individual Signal A/B members by train-period IC."""
     index = futures_pnl.index
     target = futures_pnl["CORN"].shift(-1)
-    train_mask = pd.Series(index < pd.Timestamp(CORN_TRAIN_END), index=index)
-    validation_mask = pd.Series((index >= pd.Timestamp(CORN_TRAIN_END)) & (index < pd.Timestamp(SPLIT_DATE)), index=index)
-    test_mask = pd.Series(index >= pd.Timestamp(SPLIT_DATE), index=index)
+    split_masks = corn_research_split_masks(index)
 
     rows, selected_signals = [], []
     for family, members in families.items():
         for signal_name, signal in members.items():
             raw_signal = signal.reindex(index).fillna(0.0)
-            train_ic = rank_ic_product_flow(raw_signal, target, train_mask)
+            train_ic = rank_ic_product_flow(raw_signal, target, split_masks["train"])
             orientation = 1.0 if pd.isnull(train_ic) or train_ic >= 0.0 else -1.0
             oriented_signal = clean_product_flow_signal(orientation * raw_signal, index)
             selected = bool(pd.notnull(train_ic) and abs(train_ic) >= float(min_abs_ic))
@@ -880,8 +526,8 @@ def corn_select_by_ic_signal(families, futures_pnl, min_abs_ic=CORN_IC_THRESHOLD
                 "train_ic": train_ic,
                 "orientation": orientation,
                 "selected": selected,
-                "validation_ic": rank_ic_product_flow(oriented_signal, target, validation_mask),
-                "test_ic": rank_ic_product_flow(oriented_signal, target, test_mask),
+                "validation_ic": rank_ic_product_flow(oriented_signal, target, split_masks["validation"]),
+                "test_ic": rank_ic_product_flow(oriented_signal, target, split_masks["test"]),
             })
 
     table = pd.DataFrame(rows)
@@ -892,20 +538,10 @@ def corn_select_by_ic_signal(families, futures_pnl, min_abs_ic=CORN_IC_THRESHOLD
     return selected_signal, table
 
 
-def rank_ic_product_flow(signal, target, mask):
-    aligned = pd.concat([signal, target], axis=1).dropna()
-    if aligned.empty:
-        return np.nan
-    mask = pd.Series(mask, index=signal.index).reindex(aligned.index).fillna(False).astype(bool)
-    aligned = aligned.loc[mask]
-    if len(aligned) < 40 or aligned.iloc[:, 0].std() == 0.0 or aligned.iloc[:, 1].std() == 0.0:
-        return np.nan
-    return aligned.iloc[:, 0].rank().corr(aligned.iloc[:, 1].rank())
-
-
 def corn_trend_mr_family_signal(families, futures_pnl, feature_panels):
     index = futures_pnl.index
     target = futures_pnl["CORN"].shift(-1)
+    split_masks = corn_research_split_masks(index)
     trend_strength = feature_panels["CORN"]["mom_60"].abs().reindex(index).fillna(0.0)
     threshold = trend_strength.expanding(min_periods=252).median().shift(1)
     regimes = {
@@ -917,8 +553,8 @@ def corn_trend_mr_family_signal(families, futures_pnl, feature_panels):
     for regime_name, regime_mask in regimes.items():
         candidates = []
         for family, signal in family_signals.items():
-            train_mask = (index < pd.Timestamp(CORN_TRAIN_END)) & regime_mask
-            validation_mask = (index >= pd.Timestamp(CORN_TRAIN_END)) & (index < pd.Timestamp(SPLIT_DATE)) & regime_mask
+            train_mask = split_masks["train"] & regime_mask
+            validation_mask = split_masks["validation"] & regime_mask
             train_ic = rank_ic_product_flow(signal, target, train_mask)
             orientation = 1.0 if pd.isnull(train_ic) or train_ic >= 0.0 else -1.0
             validation_ic = rank_ic_product_flow(orientation * signal, target, validation_mask)
@@ -940,12 +576,73 @@ def corn_trend_mr_family_signal(families, futures_pnl, feature_panels):
     return clean_product_flow_signal(sum(pieces), index), pd.DataFrame(rows)
 
 
-def corn_dynamic_linear_family_signal(families, futures_pnl, min_train_days=504, refit_every=21, alpha=100.0):
+def _standardize_family_frame(x_frame, mean, std):
+    return ((x_frame - mean) / std).replace([np.inf, -np.inf], 0.0).values.astype(float)
+
+
+def _fit_expanding_ols_state(x_train, y_train, rcond=1.0e-8):
+    mean = x_train.mean()
+    std = x_train.std().replace(0.0, np.nan).fillna(1.0)
+    x_std = _standardize_family_frame(x_train, mean, std)
+    y_values = y_train.values.astype(float)
+    x_aug = np.column_stack([np.ones(len(x_std)), x_std])
+
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        beta = np.linalg.pinv(x_aug, rcond=float(rcond)) @ y_values
+        residual = y_values - x_aug @ beta
+        covariance = np.linalg.pinv(x_aug.T @ x_aug, rcond=float(rcond))
+
+    if not np.isfinite(beta).all():
+        beta = np.zeros(x_aug.shape[1], dtype=float)
+        beta[0] = float(np.nanmean(y_values)) if len(y_values) else 0.0
+        residual = y_values - x_aug @ beta
+
+    obs_var = float(np.nanvar(residual))
+    if not np.isfinite(obs_var) or obs_var <= 1.0e-12:
+        obs_var = float(np.nanvar(y_values)) if len(y_values) > 1 else 1.0
+    obs_var = max(obs_var, 1.0)
+    if not np.isfinite(covariance).all():
+        covariance = np.eye(x_aug.shape[1])
+    covariance = covariance * obs_var
+    covariance = covariance + np.eye(covariance.shape[0]) * 1.0e-6
+    return beta, covariance, mean, std, obs_var
+
+
+def _kalman_update(beta, covariance, x_vector, observed_y, obs_var, process_noise):
+    covariance = covariance + np.eye(len(beta)) * float(process_noise)
+    denom = float(x_vector @ covariance @ x_vector + obs_var)
+    if not np.isfinite(denom) or denom <= 1.0e-12:
+        return beta, covariance
+    gain = covariance @ x_vector / denom
+    innovation = float(observed_y - x_vector @ beta)
+    beta = beta + gain * innovation
+    covariance = covariance - np.outer(gain, x_vector) @ covariance
+    return beta, covariance
+
+
+def _coefficient_row(beta, date, columns):
+    return {
+        "date": date,
+        "intercept": float(beta[0]),
+        **{f"beta_{column}": float(beta[j + 1]) for j, column in enumerate(columns)},
+    }
+
+
+def corn_dynamic_linear_family_signal(families, futures_pnl, min_train_days=504, refit_every=21,
+                                      process_noise=1.0e-5):
+    """Walk-forward OLS/Kalman benchmark over family-level corn signals.
+
+    Coefficients start from an expanding OLS fit, then receive a recursive
+    Kalman/RLS-style update when the prior day's forward return becomes known.
+    The model is periodically refreshed with expanding OLS so coefficients do
+    not drift indefinitely.
+    """
     index = futures_pnl.index
     x = pd.DataFrame({name: corn_family_signal(signals, index) for name, signals in families.items()}, index=index).fillna(0.0)
     y = futures_pnl["CORN"].shift(-1)
     pred = pd.Series(np.nan, index=index)
-    beta, last_fit = None, None
+    beta, covariance, last_fit = None, None, None
+    obs_var = 1.0
     rows = []
     for i, date in enumerate(index):
         train_mask = (index < date) & y.notna()
@@ -954,38 +651,28 @@ def corn_dynamic_linear_family_signal(families, futures_pnl, min_train_days=504,
         x_train_raw = x.loc[train_mask]
         mean = x_train_raw.mean()
         std = x_train_raw.std().replace(0.0, np.nan).fillna(1.0)
-        if beta is None or last_fit is None or (i - last_fit) >= refit_every:
-            x_train = ((x_train_raw - mean) / std).values.astype(float)
-            y_train = y.loc[train_mask].values.astype(float)
-            x_aug = np.column_stack([np.ones(len(x_train)), x_train])
-            xtx = x_aug.T @ x_aug
-            penalty = np.eye(xtx.shape[0]) * float(alpha)
-            penalty[0, 0] = 0.0
-            try:
-                beta = np.linalg.solve(xtx + penalty, x_aug.T @ y_train)
-            except np.linalg.LinAlgError:
-                beta = np.linalg.pinv(xtx + penalty) @ x_aug.T @ y_train
+
+        if beta is None or covariance is None or last_fit is None or (i - last_fit) >= refit_every:
+            beta, covariance, _, _, obs_var = _fit_expanding_ols_state(x_train_raw, y.loc[train_mask])
             last_fit = i
-            rows.append({"date": date, "intercept": beta[0], **{f"beta_{c}": beta[j + 1] for j, c in enumerate(x.columns)}})
-        x_row = ((x.loc[date] - mean) / std).replace([np.inf, -np.inf], 0.0)
-        pred.loc[date] = np.r_[1.0, np.asarray(x_row, dtype=float)] @ beta
+        elif i > 0 and pd.notnull(y.iloc[i - 1]):
+            x_prev = _standardize_family_frame(x.iloc[[i - 1]], mean, std)[0]
+            x_prev_aug = np.r_[1.0, x_prev]
+            beta, covariance = _kalman_update(
+                beta,
+                covariance,
+                x_prev_aug,
+                float(y.iloc[i - 1]),
+                obs_var,
+                process_noise,
+            )
+
+        rows.append(_coefficient_row(beta, date, x.columns))
+        x_row = _standardize_family_frame(x.loc[[date]], mean, std)[0]
+        pred.loc[date] = float(np.r_[1.0, x_row] @ beta)
     mean = pred.rolling(252, min_periods=60).mean().shift(1)
     std = pred.rolling(252, min_periods=60).std().shift(1).replace(0.0, np.nan)
     return clean_product_flow_signal(((pred - mean) / std).clip(-5.0, 5.0), index), pd.DataFrame(rows)
-
-
-def smooth_corn_signal(signal, mode="long_short"):
-    index = signal.index
-    out = pd.Series(np.tanh(signal.astype(float) / 2.0), index=index)
-    out = out.ewm(halflife=2.0, adjust=False, min_periods=1).mean()
-    out[out.abs() < 0.05] = 0.0
-    if mode == "long_only":
-        out = out.clip(lower=0.0)
-    elif mode == "short_only":
-        out = out.clip(upper=0.0)
-    elif mode != "long_short":
-        raise ValueError(f"Unknown mode: {mode}")
-    return out.fillna(0.0)
 
 
 def corn_positions_from_signal(signal, futures_pnl, mode="long_short",
@@ -1003,31 +690,27 @@ def corn_positions_from_signal(signal, futures_pnl, mode="long_short",
     return positions
 
 
+def _backtest_corn_positions(positions, futures_pnl, trade_cost_per_lot=CORN_TRADE_COST_PER_LOT,
+                             holding_cost_rate=CORN_HOLDING_COST_RATE):
+    """Corn wrapper around the shared cost-aware backtest engine."""
+    return backtest_positions_with_costs(
+        positions,
+        futures_pnl,
+        trade_cost_per_lot=trade_cost_per_lot,
+        holding_cost_rate=holding_cost_rate,
+        margin_per_lot=DEFAULT_MARGIN_PER_LOT,
+    )
+
+
 def backtest_positions_product_flow(positions, futures_pnl, trade_cost_per_lot=CORN_TRADE_COST_PER_LOT,
                                     holding_cost_rate=CORN_HOLDING_COST_RATE):
-    """Product-flow-style cost accounting using margin funding per lot."""
-    adjusted_positions = positions.reindex(futures_pnl.index).fillna(0.0)
-    held_positions = adjusted_positions.shift(1).fillna(0.0)
-    pnl = futures_pnl.reindex(adjusted_positions.index).fillna(0.0)
-    gross = held_positions * pnl
-    turnover_by_asset = adjusted_positions.diff().abs().fillna(0.0)
-    trade_cost = turnover_by_asset * float(trade_cost_per_lot)
-    margin = pd.Series({c: DEFAULT_MARGIN_PER_LOT.get(c, 2500.0) for c in adjusted_positions.columns})
-    margin_use = held_positions.abs().mul(margin, axis=1)
-    holding_cost = margin_use * (float(holding_cost_rate) / 252.0)
-    net = gross - trade_cost - holding_cost
-    result = pd.DataFrame(index=adjusted_positions.index)
-    result["gross_pnl"] = gross.sum(axis=1)
-    result["trade_cost"] = trade_cost.sum(axis=1)
-    result["holding_cost"] = holding_cost.sum(axis=1)
-    result["costs"] = result["trade_cost"] + result["holding_cost"]
-    result["net_pnl"] = net.sum(axis=1)
-    result["turnover"] = turnover_by_asset.sum(axis=1)
-    result["gross_exposure"] = adjusted_positions.abs().sum(axis=1)
-    result["held_gross_exposure"] = held_positions.abs().sum(axis=1)
-    result["margin_used"] = margin_use.sum(axis=1)
-    result["cum_pnl"] = result["net_pnl"].cumsum()
-    return result, net
+    """Compatibility wrapper for the GitHub corn notebook."""
+    return _backtest_corn_positions(
+        positions,
+        futures_pnl,
+        trade_cost_per_lot=trade_cost_per_lot,
+        holding_cost_rate=holding_cost_rate,
+    )
 
 
 def product_flow_performance_metrics(bt):
@@ -1082,7 +765,8 @@ def product_flow_period_performance(bt, periods=None):
         periods = REGIME_PERIODS
     rows = []
     for item in periods:
-        start, end = pd.Timestamp(item["start"]), pd.Timestamp(item["end"])
+        start = pd.Timestamp(item["start"])
+        end = pd.Timestamp(item["end"])
         metrics = product_flow_performance_metrics(bt.loc[(bt.index >= start) & (bt.index <= end)])
         row = {"period": item["period"], "start": start, "end": end}
         for key, value in metrics.items():
@@ -1106,11 +790,7 @@ def corn_vol_regime_masks(feature_panels, futures_pnl):
 def corn_regime_signal_ic_table(signals, futures_pnl, regime_mask):
     index = futures_pnl.index
     target = futures_pnl["CORN"].shift(-1)
-    splits = {
-        "train": pd.Series(index < pd.Timestamp(CORN_TRAIN_END), index=index),
-        "validation": pd.Series((index >= pd.Timestamp(CORN_TRAIN_END)) & (index < pd.Timestamp(SPLIT_DATE)), index=index),
-        "test": pd.Series(index >= pd.Timestamp(SPLIT_DATE), index=index),
-    }
+    splits = corn_research_split_masks(index)
     rows = []
     regime = pd.Series(regime_mask, index=index).fillna(False).astype(bool)
     for name, signal in signals.items():
@@ -1130,23 +810,9 @@ def corn_regime_signal_ic_table(signals, futures_pnl, regime_mask):
 
 
 def corn_candidate_families(selected_signals):
-    definitions = {
-        "price": ["given_mom_20", "given_mom_60", "given_rev_5", "given_price_family"],
-        "physical": [
-            "given_inventory_pressure",
-            "given_cgl_inventory_pressure",
-            "given_cgl_crush_activity",
-            "given_curve_tightness",
-            "given_physical_family",
-        ],
-        "ethanol": ["external_ethanol_family"],
-        "fx_export": ["external_fx_export_family"],
-        "weather": ["external_weather_hdd_cdd_family"],
-        "macro": ["external_macro_risk_family", "external_relative_grain_family"],
-    }
     families, members = {}, {}
     index = next(iter(selected_signals.values())).index
-    for family, names in definitions.items():
+    for family, names in CANDIDATE_FAMILY_DEFINITIONS.items():
         used = [selected_signals[name] for name in names if name in selected_signals]
         if used:
             families[family] = mean_product_flow_signals(used, index)
@@ -1155,21 +821,11 @@ def corn_candidate_families(selected_signals):
 
 
 def corn_candidate_composites(families):
-    definitions = {
-        "selected_all_equal": list(families.keys()),
-        "physical_only": ["physical"],
-        "price_physical_equal": ["price", "physical"],
-        "physical_fx_equal": ["physical", "fx_export"],
-        "physical_weather_equal": ["physical", "weather"],
-        "physical_macro_equal": ["physical", "macro"],
-        "physical_ethanol_equal": ["physical", "ethanol"],
-        "physical_ethanol_fx_equal": ["physical", "ethanol", "fx_export"],
-        "physical_ethanol_weather_equal": ["physical", "ethanol", "weather"],
-        "physical_ethanol_fx_weather_equal": ["physical", "ethanol", "fx_export", "weather"],
-    }
     candidates, members = {}, {}
     index = next(iter(families.values())).index
-    for candidate, family_names in definitions.items():
+    for candidate, family_names in CANDIDATE_COMPOSITE_DEFINITIONS.items():
+        if family_names is None:
+            family_names = list(families.keys())
         used = [families[name] for name in family_names if name in families]
         if not used:
             continue
@@ -1197,11 +853,7 @@ def select_corn_candidate_for_regime(signals, futures_pnl, regime_mask):
 
     target = futures_pnl["CORN"].shift(-1)
     regime = pd.Series(regime_mask, index=index).fillna(False).astype(bool)
-    splits = {
-        "train": pd.Series(index < pd.Timestamp(CORN_TRAIN_END), index=index),
-        "validation": pd.Series((index >= pd.Timestamp(CORN_TRAIN_END)) & (index < pd.Timestamp(SPLIT_DATE)), index=index),
-        "test": pd.Series(index >= pd.Timestamp(SPLIT_DATE), index=index),
-    }
+    splits = corn_research_split_masks(index)
     rows = []
     for candidate, signal in candidates.items():
         candidate_signal = signal.clip(lower=0.0)
@@ -1250,30 +902,14 @@ def build_corn_vol_regime_signal(signals, feature_panels, futures_pnl):
 
 
 def corn_abundant_supply_masks(data, feature_panels, futures_pnl):
+    """Fixed weak-tape guard used by the corn backtest notebook."""
     index = futures_pnl.index
     price = data["adj1"]["CORN"].reindex(index).ffill()
     below_ma = price < price.rolling(252, min_periods=120).mean().shift(1)
     mom60_negative = feature_panels["CORN"]["mom_60"].reindex(index).fillna(0.0) < 0.0
-    pnl = futures_pnl["CORN"].fillna(0.0)
-    vol = pnl.rolling(60, min_periods=20).std().shift(1)
-    lt_vol = vol.expanding(min_periods=252).median().shift(1)
-    low_or_normal_vol = (vol <= 1.05 * lt_vol).fillna(False)
-    low_vol = (vol < 0.80 * lt_vol).fillna(False)
-    curve_weak = feature_panels["CORN"]["curve_spread"].reindex(index).fillna(0.0) <= 0.0
     return {
-        "below_ma_and_negative_mom": (below_ma & mom60_negative).fillna(False),
         "below_ma_or_negative_mom": (below_ma | mom60_negative).fillna(False),
-        "abundant_low_or_normal": (below_ma & mom60_negative & low_or_normal_vol).fillna(False),
-        "abundant_low_vol": (below_ma & mom60_negative & low_vol).fillna(False),
-        "abundant_curve_confirmed": (below_ma & mom60_negative & curve_weak).fillna(False),
     }
-
-
-def scale_corn_positions_when(positions, condition, scale):
-    out = positions.copy()
-    mask = pd.Series(condition, index=positions.index).fillna(False).astype(bool)
-    out.loc[mask, "CORN"] = float(scale) * out.loc[mask, "CORN"]
-    return out.fillna(0.0)
 
 
 def corn_candidate_key(candidate):
@@ -1281,6 +917,32 @@ def corn_candidate_key(candidate):
         f'{candidate["source_table"]}|{candidate["signal_set"]}|'
         f'{candidate["strategy"]}|{candidate["mode"]}|{candidate["note"]}'
     )
+
+
+def _candidate_metadata(candidate):
+    return {k: v for k, v in candidate.items() if k not in ["positions", "signal"]}
+
+
+def _summarized_candidate_row(candidate, futures_pnl):
+    bt, _ = _backtest_corn_positions(candidate["positions"], futures_pnl)
+    row = _candidate_metadata(candidate)
+    row["candidate_key"] = corn_candidate_key(candidate)
+    row.update(summarize_corn_backtest(bt))
+    return row, bt
+
+
+def _supply_guard_row_metadata(candidate, base_key, guard_name):
+    return {
+        "candidate_key": base_key,
+        "source_table": candidate["source_table"],
+        "selection_rule": candidate["selection_rule"],
+        "signal_set": candidate["signal_set"],
+        "base_strategy": candidate["strategy"],
+        "base_mode": candidate["mode"],
+        "note": candidate["note"],
+        "guard": guard_name,
+        "strategy": f'{candidate["strategy"]}__{guard_name}',
+    }
 
 
 def build_corn_carry_forward_candidates(specs, combo_results, combo_positions, combo_signals,
@@ -1344,42 +1006,34 @@ def make_corn_candidate(source_table, selection_rule, signal_set, strategy, mode
 def summarize_corn_candidates(candidates, futures_pnl):
     rows = []
     for candidate in candidates:
-        bt, _ = backtest_positions_product_flow(candidate["positions"], futures_pnl)
-        row = {k: v for k, v in candidate.items() if k not in ["positions", "signal"]}
-        row["candidate_key"] = corn_candidate_key(candidate)
-        row.update(summarize_corn_backtest(bt))
+        row, _ = _summarized_candidate_row(candidate, futures_pnl)
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def run_corn_supply_guard_tests(candidates, supply_masks, futures_pnl, trading_index, oos_start=SPLIT_DATE):
+def run_corn_supply_guard_tests(candidates, supply_masks, futures_pnl, trading_index,
+                                oos_start=SPLIT_DATE, guard_specs=()):
     rows, backtests, positions_by_key = [], {}, {}
+    guard_specs = list(guard_specs)
     candidate_by_key = {corn_candidate_key(candidate): candidate for candidate in candidates}
     for candidate in candidates:
         base_key = corn_candidate_key(candidate)
-        guard_tests = {"no_guard": candidate["positions"]}
-        for mask_name, mask in supply_masks.items():
-            guard_tests[f"{mask_name}_half"] = scale_corn_positions_when(candidate["positions"], mask, 0.50)
-            guard_tests[f"{mask_name}_flat"] = scale_corn_positions_when(candidate["positions"], mask, 0.0)
+        guard_tests = {"no_guard": (candidate["positions"], None)}
+        for spec in guard_specs:
+            mask_name = spec["mask"]
+            guard_name = spec.get("name") or f"{mask_name}_{spec['scale']:.2f}"
+            guard_tests[guard_name] = (
+                scale_corn_positions_when(candidate["positions"], supply_masks[mask_name], spec["scale"]),
+                mask_name,
+            )
 
-        for guard_name, positions in guard_tests.items():
-            bt, _ = backtest_positions_product_flow(positions, futures_pnl)
-            row = {
-                "candidate_key": base_key,
-                "source_table": candidate["source_table"],
-                "selection_rule": candidate["selection_rule"],
-                "signal_set": candidate["signal_set"],
-                "base_strategy": candidate["strategy"],
-                "base_mode": candidate["mode"],
-                "note": candidate["note"],
-                "guard": guard_name,
-                "strategy": f'{candidate["strategy"]}__{guard_name}',
-            }
+        for guard_name, (positions, mask_name) in guard_tests.items():
+            bt, _ = _backtest_corn_positions(positions, futures_pnl)
+            row = _supply_guard_row_metadata(candidate, base_key, guard_name)
             row.update(summarize_corn_backtest(bt))
-            if guard_name == "no_guard":
+            if mask_name is None:
                 row["guard_oos_pct"] = 0.0
             else:
-                mask_name = guard_name.rsplit("_", 1)[0]
                 mask = pd.Series(supply_masks[mask_name], index=trading_index)
                 row["guard_oos_pct"] = float(mask.loc[trading_index >= pd.Timestamp(oos_start)].mean())
             rows.append(row)
@@ -1390,67 +1044,571 @@ def run_corn_supply_guard_tests(candidates, supply_masks, futures_pnl, trading_i
     return results, backtests, positions_by_key, candidate_by_key
 
 
-def compare_selected_corn_long_only(best_row, candidate_by_key, supply_masks, futures_pnl,
-                                    trading_index, selected_positions_by_key,
-                                    oos_start=SPLIT_DATE):
-    base_candidate = candidate_by_key[best_row["candidate_key"]]
-    long_only_candidate = make_corn_candidate(
-        base_candidate["source_table"],
-        "same_signal_as_selected_long_short",
-        base_candidate["signal_set"],
-        base_candidate["strategy"],
-        "long_only",
-        base_candidate["note"],
-        base_candidate["signal"],
-        corn_positions_from_signal(base_candidate["signal"], futures_pnl, mode="long_only"),
+DD_COLUMNS = ["validation_dd", "trade_dd", "oos_dd", "full_dd", "max_drawdown"]
+
+
+def corn_dd_pct_table(table, columns=None, dd_capital_usd=10000.0):
+    out = table.copy()
+    if columns is not None:
+        out = out[columns].copy()
+    rename = {}
+    for column in DD_COLUMNS:
+        if column in out.columns:
+            out[column] = 100.0 * out[column] / float(dd_capital_usd)
+            rename[column] = "max_dd_pct" if column == "max_drawdown" else f"{column}_pct"
+    return out.rename(columns=rename)
+
+
+def load_corn_research_context(data_dir="train_set", commodity="CORN"):
+    data = load_train_set(data_dir)
+    feature_panels, futures_pnl_all = build_product_flow_feature_panels(data)
+    futures_pnl = futures_pnl_all[[commodity]].copy()
+    trading_index = futures_pnl.index
+    signals = build_corn_product_flow_signal_universe(feature_panels, futures_pnl_all, data_dir)
+    families_by_set = corn_signal_set_families(signals)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "commodity": commodity,
+                "start": trading_index.min().date(),
+                "end": trading_index.max().date(),
+                "rows": len(trading_index),
+                "corn_features": feature_panels[commodity].shape[1],
+                "signals": len(signals),
+                "has_cargill_crush_activity": {"crush_surprise", "crush_utilization"}.issubset(
+                    feature_panels[commodity].columns
+                ),
+                "train_rows": int((trading_index < pd.Timestamp(CORN_TRAIN_END)).sum()),
+                "validation_rows": int(
+                    ((trading_index >= pd.Timestamp(CORN_TRAIN_END)) & (trading_index < pd.Timestamp(SPLIT_DATE))).sum()
+                ),
+                "oos_rows": int((trading_index >= pd.Timestamp(SPLIT_DATE)).sum()),
+            }
+        ]
     )
-    results, backtests, positions_by_key, _ = run_corn_supply_guard_tests(
-        [long_only_candidate],
+
+    coverage = []
+    for signal_set, family_map in families_by_set.items():
+        for family, members in family_map.items():
+            coverage.append(
+                {
+                    "signal_set": signal_set,
+                    "family": family,
+                    "signals": len(members),
+                    "nonzero_signals": int(sum(series.abs().sum() > 0.0 for series in members.values())),
+                }
+            )
+
+    return {
+        "data": data,
+        "feature_panels": feature_panels,
+        "futures_pnl_all": futures_pnl_all,
+        "futures_pnl": futures_pnl,
+        "trading_index": trading_index,
+        "signals": signals,
+        "families_by_set": families_by_set,
+        "summary": summary,
+        "coverage": pd.DataFrame(coverage),
+        "commodity": commodity,
+    }
+
+
+def evaluate_corn_signal(context, test, signal_set, strategy, signal, mode="long_short", note=""):
+    futures_pnl = context["futures_pnl"]
+    positions = corn_positions_from_signal(signal, futures_pnl, mode=mode)
+    bt, _ = backtest_positions_product_flow(positions, futures_pnl)
+    row = {
+        "test": test,
+        "signal_set": signal_set,
+        "strategy": strategy,
+        "mode": mode,
+        "note": note,
+    }
+    row.update(summarize_corn_backtest(bt))
+    return row, bt, positions
+
+
+def _make_family_features(families, index):
+    return pd.DataFrame(
+        {family: corn_equal_family_signal({family: members}, index) for family, members in families.items()},
+        index=index,
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _zscore_from_train(x_train, x_row):
+    mean = x_train.mean()
+    std = x_train.std().replace(0.0, np.nan)
+    return (
+        ((x_train - mean) / std).clip(lower=-5.0, upper=5.0).fillna(0.0),
+        ((x_row - mean) / std).clip(lower=-5.0, upper=5.0).fillna(0.0),
+    )
+
+
+def _fit_ols(x_train, y_train):
+    x_design = np.column_stack([np.ones(len(x_train)), np.asarray(x_train, dtype=float)])
+    beta, *_ = np.linalg.lstsq(x_design, np.asarray(y_train, dtype=float), rcond=None)
+    return beta
+
+
+def _expanding_ols_prediction(x, y, min_train_days=504, refit_every=21):
+    preds = pd.Series(np.nan, index=x.index)
+    beta = None
+    last_fit_i = None
+    for i, date in enumerate(x.index):
+        train_mask = (x.index < date) & y.notna()
+        if train_mask.sum() < min_train_days:
+            continue
+        if beta is None or last_fit_i is None or (i - last_fit_i) >= refit_every:
+            x_train_raw = x.loc[train_mask]
+            y_train = y.loc[train_mask]
+            x_train, x_row = _zscore_from_train(x_train_raw, x.loc[date])
+            beta = _fit_ols(x_train, y_train)
+            last_fit_i = i
+        else:
+            _, x_row = _zscore_from_train(x.loc[train_mask], x.loc[date])
+        preds.loc[date] = np.r_[1.0, np.asarray(x_row, dtype=float)].dot(beta)
+    return preds
+
+
+def _kalman_prediction(x, y, min_train_days=504, process_noise=1.0e-5):
+    columns = list(x.columns)
+    beta = np.zeros(len(columns) + 1)
+    covariance = np.eye(len(beta)) * 10.0
+    preds = pd.Series(np.nan, index=x.index)
+    mean = pd.Series(0.0, index=columns)
+    var = pd.Series(1.0, index=columns)
+    target_var = 1.0
+    n = 0
+    for date in x.index:
+        row = x.loc[date]
+        if n > min_train_days:
+            std = np.sqrt(var.clip(lower=1.0e-8))
+            z = ((row - mean) / std).clip(lower=-5.0, upper=5.0)
+            preds.loc[date] = np.r_[1.0, np.asarray(z, dtype=float)].dot(beta)
+        y_value = y.loc[date]
+        if pd.notnull(y_value):
+            n += 1
+            old_mean = mean.copy()
+            mean = mean + (row - mean) / float(n)
+            var = ((n - 2.0) / max(n - 1.0, 1.0)) * var + (
+                (row - old_mean) * (row - mean)
+            ) / max(n - 1.0, 1.0)
+            target_var = target_var + (float(y_value) ** 2 - target_var) / float(n)
+            if n > min_train_days:
+                std = np.sqrt(var.clip(lower=1.0e-8))
+                z = ((row - mean) / std).clip(lower=-5.0, upper=5.0)
+                phi = np.r_[1.0, np.asarray(z, dtype=float)]
+                covariance = covariance + np.eye(len(beta)) * float(process_noise)
+                innovation_var = float(phi.dot(covariance).dot(phi) + max(target_var, 1.0))
+                gain = covariance.dot(phi) / innovation_var
+                beta = beta + gain * float(y_value - phi.dot(beta))
+                covariance = covariance - np.outer(gain, phi).dot(covariance)
+    return preds
+
+
+def _prediction_to_signal(prediction, index):
+    prediction = prediction.replace([np.inf, -np.inf], np.nan)
+    mean = prediction.rolling(252, min_periods=60).mean().shift(1)
+    std = prediction.rolling(252, min_periods=60).std().shift(1).replace(0.0, np.nan)
+    return clean_product_flow_signal(((prediction - mean) / std).clip(lower=-5.0, upper=5.0), index)
+
+
+def run_corn_generic_signal_tests(context):
+    trading_index = context["trading_index"]
+    futures_pnl = context["futures_pnl"]
+    families_by_set = context["families_by_set"]
+    feature_panels = context["feature_panels"]
+    commodity = context["commodity"]
+
+    rows, backtests, positions = [], {}, {}
+    for signal_set in ["A", "B"]:
+        families = families_by_set[signal_set]
+        trend_signal, _ = corn_trend_mr_family_signal(families, futures_pnl, feature_panels)
+        ic_signal, _ = corn_select_by_ic_signal(families, futures_pnl)
+        family_features = _make_family_features(families, trading_index)
+        model_target = futures_pnl[commodity].shift(-1)
+        ols_signal = _prediction_to_signal(_expanding_ols_prediction(family_features, model_target), trading_index)
+        kalman_signal = _prediction_to_signal(_kalman_prediction(family_features, model_target), trading_index)
+
+        tests = [
+            ("avg_all_signals", corn_average_all_signals(families, trading_index)),
+            ("equal_family", corn_equal_family_signal(families, trading_index)),
+            ("best_family_by_trend_mr", trend_signal),
+            ("select_by_ic", ic_signal),
+            ("expanding_ols_family_model", ols_signal),
+            ("kalman_family_model", kalman_signal),
+        ]
+        for strategy, signal in tests:
+            row, bt, pos = evaluate_corn_signal(context, "generic", signal_set, strategy, signal, mode="long_short")
+            rows.append(row)
+            backtests[(signal_set, strategy, "long_short")] = bt
+            positions[(signal_set, strategy, "long_short")] = pos
+
+    results = pd.DataFrame(rows).sort_values(
+        ["signal_set", "validation_sharpe", "oos_sharpe"],
+        ascending=[True, False, False],
+    )
+    return {"results": results, "backtests": backtests, "positions": positions}
+
+
+def run_corn_momentum_mr_benchmarks(context):
+    data = context["data"]
+    feature_panels = context["feature_panels"]
+    futures_pnl = context["futures_pnl"]
+    trading_index = context["trading_index"]
+    commodity = context["commodity"]
+    corn_panel = feature_panels[commodity].reindex(trading_index).fillna(0.0)
+
+    signals = {
+        "mom_20": clean_product_flow_signal(corn_panel["mom_20"], trading_index),
+        "mom_60": clean_product_flow_signal(corn_panel["mom_60"], trading_index),
+        "rev_5": clean_product_flow_signal(corn_panel["rev_5"], trading_index),
+        "mom_60_rev_5_equal": clean_product_flow_signal(
+            mean_product_flow_signals([corn_panel["mom_60"], corn_panel["rev_5"]], trading_index),
+            trading_index,
+        ),
+    }
+    trend_strength = corn_panel["mom_60"].abs()
+    trend_threshold = trend_strength.expanding(min_periods=252).median().shift(1)
+    trend_regime = (trend_strength > trend_threshold).fillna(False)
+    signals["trend_mom_else_mr"] = clean_product_flow_signal(
+        pd.Series(np.where(trend_regime, corn_panel["mom_60"], corn_panel["rev_5"]), index=trading_index),
+        trading_index,
+    )
+
+    rows, candidates = [], []
+    for name, signal in signals.items():
+        row, _, pos = evaluate_corn_signal(context, "momentum_mr_benchmark", "price_only", name, signal)
+        rows.append(row)
+        candidates.append(
+            make_corn_candidate(
+                "momentum_mr_benchmark",
+                "simple_price_rule",
+                "price_only",
+                name,
+                "long_short",
+                "raw",
+                signal,
+                pos,
+            )
+        )
+
+    results = pd.DataFrame(rows).sort_values(["oos_sharpe", "full_sharpe"], ascending=[False, False])
+    supply_masks = corn_abundant_supply_masks(data, feature_panels, futures_pnl)
+    guard_results, guard_backtests, guard_positions, candidate_by_key = run_corn_supply_guard_tests(
+        candidates,
         supply_masks,
         futures_pnl,
         trading_index,
-        oos_start=oos_start,
+        oos_start=SPLIT_DATE,
     )
-    best_long_only = results.iloc[0]
-    same_guard = results.loc[results["guard"] == best_row["guard"]].iloc[0]
+    return {
+        "signals": signals,
+        "results": results,
+        "supply_masks": supply_masks,
+        "guard_results": guard_results.sort_values(["oos_sharpe", "full_sharpe"], ascending=[False, False]),
+        "guard_backtests": guard_backtests,
+        "guard_positions": guard_positions,
+        "candidate_by_key": candidate_by_key,
+    }
 
-    long_only_key = corn_candidate_key(long_only_candidate)
-    selected_positions = selected_positions_by_key[(best_row["candidate_key"], best_row["guard"])]
-    same_guard_positions = positions_by_key[(long_only_key, best_row["guard"])]
-    diff = selected_positions["CORN"] - same_guard_positions["CORN"]
-    exposure_check = pd.DataFrame([{
-        "position_check": "selected_long_short_vs_same_signal_long_only",
-        "pct_short_days": float((selected_positions["CORN"] < 0.0).mean()),
-        "min_lot": float(selected_positions["CORN"].min()),
-        "max_lot": float(selected_positions["CORN"].max()),
-        "max_abs_diff_vs_long_only": float(diff.abs().max()),
-    }])
 
-    cols = [
-        "source_table", "signal_set", "base_strategy", "base_mode", "note", "guard",
-        "validation_sharpe", "oos_sharpe", "oos_pnl", "oos_dd",
-        "full_sharpe", "full_dd", "turnover", "guard_oos_pct",
+def _walk_forward_momentum_mr_selection(signals, futures_pnl, start=SPLIT_DATE):
+    index = futures_pnl.index
+    rebalance_dates = list(pd.date_range(pd.Timestamp(start), index.max(), freq="YS"))
+    selected_signal = pd.Series(0.0, index=index)
+    rows = []
+
+    for i, rebalance_date in enumerate(rebalance_dates):
+        next_rebalance = rebalance_dates[i + 1] if i + 1 < len(rebalance_dates) else index.max() + pd.Timedelta(days=1)
+        train_end = rebalance_date - pd.DateOffset(years=2)
+        train_mask = index < train_end
+        validation_mask = (index >= train_end) & (index < rebalance_date)
+        trade_mask = (index >= rebalance_date) & (index < next_rebalance)
+
+        candidates = []
+        for name, signal in signals.items():
+            positions = corn_positions_from_signal(signal, futures_pnl)
+            bt, _ = backtest_positions_product_flow(positions, futures_pnl)
+            train_metrics = product_flow_performance_metrics(bt.loc[train_mask])
+            validation_metrics = product_flow_performance_metrics(bt.loc[validation_mask])
+            trade_metrics = product_flow_performance_metrics(bt.loc[trade_mask])
+            train_sharpe = train_metrics.get("sharpe", np.nan)
+            validation_sharpe = validation_metrics.get("sharpe", np.nan)
+            validation_dd = validation_metrics.get("max_drawdown", np.nan)
+            eligible = bool(
+                pd.notnull(train_sharpe)
+                and pd.notnull(validation_sharpe)
+                and train_sharpe > 0.0
+                and validation_sharpe > 0.0
+            )
+            score = validation_sharpe + 0.25 * train_sharpe + 0.001 * validation_dd if eligible else -np.inf
+            candidates.append(
+                {
+                    "rebalance": rebalance_date.date(),
+                    "candidate": name,
+                    "eligible": eligible,
+                    "score": score,
+                    "train_sharpe": train_sharpe,
+                    "validation_sharpe": validation_sharpe,
+                    "validation_dd": validation_dd,
+                    "trade_sharpe": trade_metrics.get("sharpe", np.nan),
+                    "trade_pnl": trade_metrics.get("total_pnl", np.nan),
+                    "trade_dd": trade_metrics.get("max_drawdown", np.nan),
+                }
+            )
+
+        candidate_table = pd.DataFrame(candidates)
+        eligible = candidate_table.loc[candidate_table["eligible"]].copy()
+        if eligible.empty:
+            selected = candidate_table.sort_values(["validation_sharpe", "train_sharpe"], ascending=[False, False]).iloc[0]
+            selection_read = "Fallback: no candidate passed positive train/validation Sharpe gate."
+        else:
+            selected = eligible.sort_values(["score", "validation_sharpe"], ascending=[False, False]).iloc[0]
+            selection_read = "Selected using only data before this rebalance date."
+
+        selected_signal.loc[trade_mask] = signals[selected["candidate"]].loc[trade_mask]
+        selected = selected.copy()
+        selected["selected"] = True
+        selected["selection_read"] = selection_read
+        rows.append(selected)
+
+    return clean_product_flow_signal(selected_signal, index), pd.DataFrame(rows)
+
+
+def _momentum_mr_oos_metric_row(name, bt):
+    oos_metrics = product_flow_performance_metrics(bt.loc[bt.index >= pd.Timestamp(SPLIT_DATE)])
+    full_metrics = product_flow_performance_metrics(bt)
+    return {
+        "strategy": name,
+        "oos_sharpe": oos_metrics.get("sharpe", np.nan),
+        "oos_pnl": oos_metrics.get("total_pnl", np.nan),
+        "oos_dd": oos_metrics.get("max_drawdown", np.nan),
+        "oos_active_days": oos_metrics.get("days", np.nan),
+        "full_sharpe": full_metrics.get("sharpe", np.nan),
+        "full_pnl": full_metrics.get("total_pnl", np.nan),
+        "full_dd": full_metrics.get("max_drawdown", np.nan),
+    }
+
+
+def run_corn_walk_forward_momentum_mr(context, momentum_mr):
+    futures_pnl = context["futures_pnl"]
+    signal, selected = _walk_forward_momentum_mr_selection(momentum_mr["signals"], futures_pnl)
+    positions = corn_positions_from_signal(signal, futures_pnl)
+    bt, _ = backtest_positions_product_flow(positions, futures_pnl)
+    static_bt, _ = backtest_positions_product_flow(
+        corn_positions_from_signal(momentum_mr["signals"]["mom_20"], futures_pnl),
+        futures_pnl,
+    )
+    comparison = pd.DataFrame(
+        [
+            _momentum_mr_oos_metric_row("static_best_raw_momentum_mr_mom_20", static_bt),
+            _momentum_mr_oos_metric_row("annual_walk_forward_momentum_mr", bt),
+        ]
+    )
+    return {"signal": signal, "selected": selected, "positions": positions, "backtest": bt, "comparison": comparison}
+
+
+def _candidate_metric_row(source_table, base_strategy, variant, guard, bt, guard_oos_pct=0.0):
+    oos_metrics = product_flow_performance_metrics(bt.loc[bt.index >= pd.Timestamp(SPLIT_DATE)])
+    full_metrics = product_flow_performance_metrics(bt)
+    return {
+        "source_table": source_table,
+        "base_strategy": base_strategy,
+        "variant": variant,
+        "guard": guard,
+        "oos_sharpe": oos_metrics.get("sharpe", np.nan),
+        "oos_pnl": oos_metrics.get("total_pnl", np.nan),
+        "oos_dd": oos_metrics.get("max_drawdown", np.nan),
+        "oos_active_days": oos_metrics.get("days", np.nan),
+        "full_sharpe": full_metrics.get("sharpe", np.nan),
+        "full_pnl": full_metrics.get("total_pnl", np.nan),
+        "full_dd": full_metrics.get("max_drawdown", np.nan),
+        "turnover": full_metrics.get("avg_daily_turnover", np.nan),
+        "avg_gross_exposure": full_metrics.get("avg_gross_exposure", np.nan),
+        "guard_oos_pct": guard_oos_pct,
+    }
+
+
+def _apply_guard_positions(positions, guard_name, masks, commodity="CORN"):
+    if guard_name == "no_guard":
+        return positions.copy(), 0.0
+    mask_name, action = guard_name.rsplit("_", 1)
+    scale = 0.50 if action == "half" else 0.0
+    mask = pd.Series(masks[mask_name], index=positions.index).fillna(False).astype(bool)
+    guarded = positions.copy()
+    guarded.loc[mask, commodity] = scale * guarded.loc[mask, commodity]
+    return guarded.fillna(0.0), float(mask.loc[mask.index >= pd.Timestamp(SPLIT_DATE)].mean())
+
+
+def _evaluate_candidate_guard_menu(context, source_table, base_strategy, variant, signal, masks):
+    futures_pnl = context["futures_pnl"]
+    commodity = context["commodity"]
+    base_positions = corn_positions_from_signal(signal, futures_pnl)
+    guard_names = ["no_guard"]
+    for mask_name in masks:
+        guard_names.extend([f"{mask_name}_half", f"{mask_name}_flat"])
+
+    rows, backtests, positions_by_guard = [], {}, {}
+    for guard_name in guard_names:
+        positions, guard_oos_pct = _apply_guard_positions(base_positions, guard_name, masks, commodity)
+        bt, _ = backtest_positions_product_flow(positions, futures_pnl)
+        key = (base_strategy, variant, guard_name)
+        rows.append(_candidate_metric_row(source_table, base_strategy, variant, guard_name, bt, guard_oos_pct))
+        backtests[key] = bt
+        positions_by_guard[key] = positions
+    return rows, backtests, positions_by_guard
+
+
+def run_corn_cargill_overlay_candidates(context, momentum_mr, walk_forward):
+    signals = context["signals"]
+    trading_index = context["trading_index"]
+    futures_pnl = context["futures_pnl"]
+    feature_panels = context["feature_panels"]
+    data = context["data"]
+
+    cargill_physical_signal = clean_product_flow_signal(
+        mean_product_flow_signals(
+            [signals["given_cgl_inventory_pressure"], signals["given_cgl_crush_activity"]],
+            trading_index,
+        ),
+        trading_index,
+    )
+    base_spine_signals = {
+        "wf_momentum_mr": walk_forward["signal"],
+        "static_mom_20": momentum_mr["signals"]["mom_20"],
+    }
+
+    candidate_signals = {}
+    for base_name, base_signal in base_spine_signals.items():
+        aligned_base = clean_product_flow_signal(base_signal, trading_index)
+        disagreement = (
+            (aligned_base * cargill_physical_signal < 0.0)
+            & (aligned_base.abs() > 0.05)
+            & (cargill_physical_signal.abs() > 0.25)
+        )
+        half_filter = aligned_base.copy()
+        half_filter.loc[disagreement] = 0.50 * half_filter.loc[disagreement]
+        flat_filter = aligned_base.copy()
+        flat_filter.loc[disagreement] = 0.0
+
+        candidate_signals[(base_name, "base_no_cargill")] = aligned_base
+        candidate_signals[(base_name, "cargill_overlay_90_10")] = clean_product_flow_signal(
+            0.90 * aligned_base + 0.10 * cargill_physical_signal,
+            trading_index,
+        )
+        candidate_signals[(base_name, "cargill_overlay_85_15")] = clean_product_flow_signal(
+            0.85 * aligned_base + 0.15 * cargill_physical_signal,
+            trading_index,
+        )
+        candidate_signals[(base_name, "cargill_disagree_half")] = clean_product_flow_signal(half_filter, trading_index)
+        candidate_signals[(base_name, "cargill_disagree_flat")] = clean_product_flow_signal(flat_filter, trading_index)
+
+    raw_rows = []
+    for (base_name, variant), signal in candidate_signals.items():
+        positions = corn_positions_from_signal(signal, futures_pnl)
+        bt, _ = backtest_positions_product_flow(positions, futures_pnl)
+        raw_rows.append(_candidate_metric_row("cargill_overlay", base_name, variant, "no_guard", bt, 0.0))
+    raw_results = pd.DataFrame(raw_rows).sort_values(
+        ["base_strategy", "oos_sharpe", "full_sharpe"],
+        ascending=[True, False, False],
+    )
+
+    supply_masks = corn_abundant_supply_masks(data, feature_panels, futures_pnl)
+    guard_rows, guard_backtests, guard_positions = [], {}, {}
+    for (base_name, variant), signal in candidate_signals.items():
+        rows, backtests, positions = _evaluate_candidate_guard_menu(
+            context,
+            "cargill_overlay_guarded",
+            base_name,
+            variant,
+            signal,
+            supply_masks,
+        )
+        guard_rows.extend(rows)
+        guard_backtests.update(backtests)
+        guard_positions.update(positions)
+
+    guard_results = pd.DataFrame(guard_rows).sort_values(["oos_sharpe", "full_sharpe"], ascending=[False, False])
+    wf_guard_results = guard_results.loc[guard_results["base_strategy"] == "wf_momentum_mr"].copy()
+    final_row = wf_guard_results.sort_values(
+        ["oos_sharpe", "full_sharpe", "oos_pnl"],
+        ascending=[False, False, False],
+    ).iloc[0]
+    final_key = (final_row["base_strategy"], final_row["variant"], final_row["guard"])
+    return {
+        "cargill_physical_signal": cargill_physical_signal,
+        "candidate_signals": candidate_signals,
+        "raw_results": raw_results,
+        "supply_masks": supply_masks,
+        "guard_results": guard_results,
+        "guard_backtests": guard_backtests,
+        "guard_positions": guard_positions,
+        "final_row": final_row,
+        "final_key": final_key,
+    }
+
+
+def build_corn_final_report(cargill):
+    final_row = cargill["final_row"]
+    final_key = cargill["final_key"]
+    guard_results = cargill["guard_results"]
+    final_periods = product_flow_period_performance(cargill["guard_backtests"][final_key])[
+        ["period", "total_pnl", "sharpe", "max_drawdown", "hit_rate", "days"]
     ]
-    comparison_rows = []
-    for label, row in [
-        ("selected_long_short", best_row),
-        ("same_signal_long_only_same_guard", same_guard),
-        ("same_signal_long_only_best_fixed_guard", best_long_only),
-    ]:
-        item = row[cols].to_dict()
-        item["check"] = label
-        comparison_rows.append(item)
-    return results, pd.DataFrame(comparison_rows)[["check"] + cols], exposure_check, backtests, positions_by_key
+    wf_base_reference = guard_results.loc[
+        (guard_results["base_strategy"] == "wf_momentum_mr")
+        & (guard_results["variant"] == "base_no_cargill")
+        & (guard_results["guard"] == "no_guard")
+    ].iloc[0]
+    mom20_guard_reference = guard_results.loc[
+        (guard_results["base_strategy"] == "static_mom_20")
+        & (guard_results["variant"] == "base_no_cargill")
+    ].sort_values(["oos_sharpe", "full_sharpe"], ascending=[False, False]).iloc[0]
+    comparison = pd.DataFrame(
+        [
+            {
+                "strategy": "final_wf_momentum_mr_cargill",
+                "variant": final_row["variant"],
+                "guard": final_row["guard"],
+                "oos_sharpe": final_row["oos_sharpe"],
+                "oos_pnl": final_row["oos_pnl"],
+                "oos_dd": final_row["oos_dd"],
+                "full_sharpe": final_row["full_sharpe"],
+                "full_dd": final_row["full_dd"],
+            },
+            {
+                "strategy": "wf_momentum_mr_base_reference",
+                "variant": wf_base_reference["variant"],
+                "guard": wf_base_reference["guard"],
+                "oos_sharpe": wf_base_reference["oos_sharpe"],
+                "oos_pnl": wf_base_reference["oos_pnl"],
+                "oos_dd": wf_base_reference["oos_dd"],
+                "full_sharpe": wf_base_reference["full_sharpe"],
+                "full_dd": wf_base_reference["full_dd"],
+            },
+            {
+                "strategy": "guarded_mom20_benchmark",
+                "variant": mom20_guard_reference["variant"],
+                "guard": mom20_guard_reference["guard"],
+                "oos_sharpe": mom20_guard_reference["oos_sharpe"],
+                "oos_pnl": mom20_guard_reference["oos_pnl"],
+                "oos_dd": mom20_guard_reference["oos_dd"],
+                "full_sharpe": mom20_guard_reference["full_sharpe"],
+                "full_dd": mom20_guard_reference["full_dd"],
+            },
+        ]
+    )
+    conclusion = f"""
+### Conclusion
 
+**Core idea:** annual walk-forward Momentum/MR is the main tradable structure.
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Display helpers
-# ═══════════════════════════════════════════════════════════════════════════
+**Cargill use:** Cargill inventory/crush activity is used as a physical disagreement filter, not as the dominant corn alpha.
 
-def header(title):
-    """Print a Markdown-style separator (works in notebooks and plain stdout)."""
-    try:
-        from IPython.display import Markdown, display
-        display(Markdown(f"### {title}"))
-    except Exception:
-        print(f"\n— {title} —\n")
+**Final corn candidate:** {final_row["base_strategy"]} with {final_row["variant"]} and guard {final_row["guard"]}. OOS Sharpe {final_row["oos_sharpe"]:.3f}, OOS PnL {final_row["oos_pnl"]:.3f}, OOS DD {100.0 * final_row["oos_dd"] / 10000.0:.2f}%, full-period Sharpe {final_row["full_sharpe"]:.3f}.
+
+The one-week recommendation is a risk-controlled Momentum/MR corn sleeve with a Cargill physical disagreement filter.
+"""
+    return {"final_periods": final_periods, "comparison": comparison, "conclusion": conclusion}
